@@ -1,0 +1,143 @@
+name: Reusable - Deploy to Kubernetes (OIDC-ready)
+
+on:
+  workflow_call:
+    inputs:
+      aws_region:
+        required: false
+        type: string
+      aws_role_to_assume:
+        required: false
+        type: string
+      cluster_name:
+        required: false
+        type: string
+      generate_kubeconfig:
+        required: false
+        type: boolean
+        default: true
+      namespace:
+        required: true
+        type: string
+      manifest_path:
+        required: true
+        type: string
+      deployment:
+        required: true
+        type: string
+      container:
+        required: true
+        type: string
+      image_ref:
+        required: true
+        type: string
+      use_kustomize:
+        required: false
+        type: boolean
+        default: false
+    secrets:
+      KUBE_CONFIG:
+        required: false
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC) if role provided
+        if: ${{ inputs.aws_role_to_assume != '' }}
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ inputs.aws_role_to_assume }}
+          aws-region: ${{ inputs.aws_region || 'us-east-1' }}
+
+      - name: Cache kubectl binary
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/bin/kubectl
+          key: kubectl-${{ runner.os }}-latest
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: 'latest'
+
+      - name: Cache kustomize binary
+        if: ${{ inputs.use_kustomize }}
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/bin/kustomize
+          key: kustomize-${{ runner.os }}-5.7.1
+
+      - name: Set up kustomize (optional)
+        if: ${{ inputs.use_kustomize }}
+        uses: imranismail/setup-kustomize@v2
+        with:
+          kustomize-version: '5.7.1'
+
+      - name: Generate kubeconfig via AWS (recommended)
+        if: ${{ inputs.generate_kubeconfig }}
+        run: |
+          set -euo pipefail
+          if [ -z "${{ inputs.cluster_name }}" ]; then
+            echo "cluster_name input is required when generate_kubeconfig=true" >&2
+            exit 1
+          fi
+          # Don't use --role-arn when we're already running as the target role
+          # This prevents circular role assumption with EKS API authentication
+          aws eks update-kubeconfig \
+            --name "${{ inputs.cluster_name }}" \
+            --region "${{ inputs.aws_region || 'us-east-1' }}" \
+            --kubeconfig "$PWD/kubeconfig" \
+            --alias "gha-deploy"
+
+      - name: Write kubeconfig from secret (fallback)
+        if: ${{ !inputs.generate_kubeconfig }}
+        run: |
+          if [ -z "${KUBE_CONFIG}" ]; then
+            echo "KUBE_CONFIG secret not provided and generate_kubeconfig=false" >&2
+            exit 1
+          fi
+          echo "${KUBE_CONFIG}" | base64 -d > kubeconfig
+          chmod 600 kubeconfig
+        env:
+          KUBE_CONFIG: ${{ secrets.KUBE_CONFIG }}
+
+      - name: Apply namespace first
+        run: |
+          # Apply environment-specific namespace if it exists, otherwise apply generic namespace
+          if [ -f "${{ inputs.manifest_path }}/namespace-${{ inputs.namespace }}.yaml" ]; then
+            KUBECONFIG=$PWD/kubeconfig kubectl apply -f "${{ inputs.manifest_path }}/namespace-${{ inputs.namespace }}.yaml"
+          elif [ -f "${{ inputs.manifest_path }}/namespace.yaml" ]; then
+            KUBECONFIG=$PWD/kubeconfig kubectl apply -f "${{ inputs.manifest_path }}/namespace.yaml"
+          fi
+
+      - name: Apply manifests first
+        if: ${{ !inputs.use_kustomize }}
+        run: |
+          # Apply environment-specific deployment if it exists, otherwise use generic
+          if [ -f "${{ inputs.manifest_path }}/deployment-${{ inputs.namespace }}.yaml" ]; then
+            KUBECONFIG=$PWD/kubeconfig kubectl -n "${{ inputs.namespace }}" apply -f "${{ inputs.manifest_path }}/deployment-${{ inputs.namespace }}.yaml"
+          else
+            KUBECONFIG=$PWD/kubeconfig kubectl -n "${{ inputs.namespace }}" apply -f "${{ inputs.manifest_path }}/deployment.yaml"
+          fi
+          # Apply service and other manifests
+          KUBECONFIG=$PWD/kubeconfig kubectl -n "${{ inputs.namespace }}" apply -f "${{ inputs.manifest_path }}/service.yaml" || true
+
+      - name: Apply kustomize first
+        if: ${{ inputs.use_kustomize }}
+        run: |
+          KUBECONFIG=$PWD/kubeconfig kustomize build "${{ inputs.manifest_path }}" | kubectl -n "${{ inputs.namespace }}" apply -f -
+
+      - name: Set image on Deployment
+        run: |
+          KUBECONFIG=$PWD/kubeconfig kubectl -n "${{ inputs.namespace }}" set image deployment/${{ inputs.deployment }} ${{ inputs.container }}=${{ inputs.image_ref }}
+
+      - name: Rollout status
+        run: |
+          KUBECONFIG=$PWD/kubeconfig kubectl -n "${{ inputs.namespace }}" rollout status deployment/${{ inputs.deployment }} --timeout=180s

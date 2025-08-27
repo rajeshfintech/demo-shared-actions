@@ -1,0 +1,165 @@
+name: Reusable - Build & Publish (Python/General)
+
+on:
+  workflow_call:
+    inputs:
+      app_name:
+        required: true
+        type: string
+      context:
+        required: false
+        type: string
+        default: "."
+      dockerfile:
+        required: false
+        type: string
+        default: "Dockerfile"
+      image_name:
+        required: false
+        type: string
+      test_command:
+        required: false
+        type: string
+        default: "pytest -q"
+      python_version:
+        required: false
+        type: string
+        default: "3.11"
+      push_latest:
+        required: false
+        type: boolean
+        default: false
+      run_trivy:
+        required: false
+        type: boolean
+        default: false
+      build_args:
+        required: false
+        type: string
+        description: "Build arguments for Docker build (multiline string)"
+        default: ""
+    outputs:
+      image:
+        description: "Canonical image reference (including @sha256 digest)."
+        value: ${{ jobs.build.outputs.image_digest_ref }}
+      image_tag:
+        description: "Tag pushed (sha)."
+        value: ${{ jobs.build.outputs.sha_tag }}
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    name: Build, Test, Push
+    runs-on: ubuntu-latest
+    outputs:
+      image_digest_ref: ${{ steps.digest.outputs.image_digest_ref }}
+      sha_tag: ${{ steps.expose_tag.outputs.sha_tag }}
+    steps:
+      - name: Checkout caller repo
+        uses: actions/checkout@v4
+
+      - name: Resolve image name
+        id: name
+        run: |
+          OWNER="${{ github.repository_owner }}"
+          APP="${{ inputs.app_name }}"
+          if [ -z "${{ inputs.image_name }}" ]; then
+            echo "image=ghcr.io/${OWNER}/${APP}" >> "$GITHUB_OUTPUT"
+          else
+            echo "image=${{ inputs.image_name }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Prepare Python (for unit tests)
+        if: ${{ hashFiles('**/requirements.txt', '**/requirements-test.txt') != '' }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python_version }}
+          cache: 'pip'
+
+      - name: Install test deps (if present)
+        if: ${{ hashFiles('**/requirements*.txt') != '' }}
+        run: |
+          python -m venv .venv
+          . .venv/bin/activate
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          if [ -f requirements-test.txt ]; then pip install -r requirements-test.txt; fi
+
+      - name: Run tests
+        if: ${{ hashFiles('**/requirements*.txt') != '' }}
+        run: |
+          . .venv/bin/activate
+          set -euo pipefail
+          ${{ inputs.test_command }}
+
+      - name: Set up QEMU (multi-arch optional)
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute metadata (tags/labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.name.outputs.image }}
+          tags: |
+            type=raw,value=sha-${{ github.sha }}
+            type=ref,event=branch
+            type=ref,event=pr
+          labels: |
+            org.opencontainers.image.source=${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+
+      - name: Expose sha_tag
+        id: expose_tag
+        run: echo "sha_tag=sha-${{ github.sha }}" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare build args
+        id: build_args
+        run: |
+          # Always include Git commit hash and build time
+          BUILD_ARGS="GIT_COMMIT_HASH=${{ github.sha }}
+          BUILD_TIME=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          GIT_BRANCH=${{ github.ref_name }}"
+          
+          # Add custom build args if provided
+          if [ -n "${{ inputs.build_args }}" ]; then
+            BUILD_ARGS="${BUILD_ARGS}
+          ${{ inputs.build_args }}"
+          fi
+          
+          # Save to output (escape newlines for GitHub Actions)
+          echo "args<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$BUILD_ARGS" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+      - name: Build & Push (final)
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile }}
+          push: true
+          build-args: ${{ steps.build_args.outputs.args }}
+          tags: |
+            ${{ steps.name.outputs.image }}:${{ steps.expose_tag.outputs.sha_tag }}
+            ${{ inputs.push_latest && github.ref == 'refs/heads/main' && format('{0}:latest', steps.name.outputs.image) || '' }}
+            ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Expose digest ref
+        id: digest
+        run: |
+          echo "image_digest_ref=${{ steps.name.outputs.image }}@${{ steps.push.outputs.digest }}" >> "$GITHUB_OUTPUT"

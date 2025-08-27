@@ -1,0 +1,55 @@
+name: Reusable - Promote Image (Retag Only)
+
+on:
+  workflow_call:
+    inputs:
+      image_digest_ref:
+        required: true
+        type: string
+      promote_to:
+        required: true
+        type: string
+    secrets:
+      GHCR_TOKEN:
+        required: false
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  retag:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Parse inputs
+        id: parse
+        run: |
+          FULL="${{ inputs.image_digest_ref }}"
+          BASE="${FULL%@*}"
+          DIGEST="${FULL#*@}"
+          echo "base=$BASE" >> $GITHUB_OUTPUT
+          echo "digest=$DIGEST" >> $GITHUB_OUTPUT
+          echo "tags=${{ inputs.promote_to }}" >> $GITHUB_OUTPUT
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GHCR_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Install skopeo
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y skopeo jq
+
+      - name: Retag (copy manifest by digest)
+        run: |
+          IFS=',' read -ra TAGS <<< "${{ steps.parse.outputs.tags }}"
+          for TAG in "${TAGS[@]}"; do
+            TAG="$(echo "$TAG" | xargs)"
+            src="docker://${{ steps.parse.outputs.base }}@${{ steps.parse.outputs.digest }}"
+            dst="docker://${{ steps.parse.outputs.base }}:${TAG}"
+            echo "Promoting ${src} -> ${dst}"
+            skopeo copy --all --retry-times 3 "$src" "$dst"
+          done
